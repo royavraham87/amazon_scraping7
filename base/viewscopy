@@ -1,0 +1,348 @@
+from django.utils import timezone
+from rest_framework.response import Response
+from rest_framework.decorators import api_view, permission_classes
+from django.contrib.auth.models import User
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework.permissions import IsAuthenticated
+from .serializers import ProductSerializer, SearchResultSerializer, WatchlistSerializer
+from .models import Product, SearchResult, TrackedProduct, Watchlist
+from rest_framework import viewsets
+from scraper.playwright_scraper import scrape_amazon  # Import the real scraper function
+from asgiref.sync import async_to_sync  # To run async function synchronously
+import time
+from django.contrib.auth import logout
+from rest_framework_simplejwt.tokens import RefreshToken, AccessToken
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+from rest_framework_simplejwt.exceptions import InvalidToken
+
+# Temporary storage for user-related data to manage search and add timing
+temp_user_data = {}
+
+# Helper functions for user data management
+def store_user_data(user_id, data):
+    """Save all necessary user data in temp_user_data."""
+    if user_id not in temp_user_data:
+        temp_user_data[user_id] = {}
+    temp_user_data[user_id].update(data)
+    print(f"Stored data for user {user_id}: {temp_user_data[user_id]}")
+
+def retrieve_user_data(user_id):
+    """Fetches stored data from temp_user_data."""
+    data = temp_user_data.get(user_id)
+    print(f"Retrieved data for user {user_id}: {data}")
+    return data
+
+def clear_user_data(user_id):
+    """Clear all data for the specific user from temp_user_data."""
+    if user_id in temp_user_data:
+        del temp_user_data[user_id]
+        print(f"Cleared all temporary data for user {user_id}")
+
+# ViewSets
+class SearchResultViewSet(viewsets.ModelViewSet):
+    queryset = SearchResult.objects.all()
+    serializer_class = SearchResultSerializer
+
+class ProductViewSet(viewsets.ModelViewSet):
+    serializer_class = ProductSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_authenticated:
+            if user.is_staff:
+                return Product.objects.all()
+            return Product.objects.filter(user=user)
+        else:
+            return Product.objects.none()
+
+class WatchlistViewSet(viewsets.ModelViewSet):
+    serializer_class = WatchlistSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        return Watchlist.objects.filter(user=user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+@api_view(['GET'])
+def index(req):
+    return Response('hello')
+
+@api_view(['GET', 'POST'])
+def custom_login(request):
+    if request.method == 'GET':
+        return Response({"message": "Please use POST to log in."})
+    view = MyTokenObtainPairView.as_view()
+    return view(request)
+
+class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token['username'] = user.username
+        print(f"Issued Token JTI: {token['jti']}")  # Debugging
+        return token
+
+
+class MyTokenObtainPairView(TokenObtainPairView):
+    serializer_class = MyTokenObtainPairSerializer
+
+@api_view(['POST'])
+def user_logout(request):
+    print("Starting logout process...")
+    
+    # Perform Django logout
+    logout(request)
+    print("Django logout completed.")
+
+    # Blacklist refresh token
+    refresh_token = request.data.get('refresh')
+    if refresh_token:
+        try:
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            print(f"Refresh token blacklisted: {refresh_token}")
+        except Exception as e:
+            print(f"Error blacklisting refresh token: {e}")
+    else:
+        print("No refresh token provided in the request body.")
+
+    # Blacklist access token
+    access_token = request.headers.get('Authorization')
+    if access_token:
+        try:
+            if access_token.startswith("Bearer "):
+                access_token = access_token.split(" ")[1]  # Remove 'Bearer ' prefix
+            
+            token = AccessToken(access_token)
+            jti = token.get('jti')  # Get the unique identifier (JTI) of the access token
+            
+            # Ensure the JTI matches an OutstandingToken
+            outstanding_token = OutstandingToken.objects.filter(jti=jti).first()
+            if outstanding_token:
+                BlacklistedToken.objects.get_or_create(token=outstanding_token)
+                print(f"Access token blacklisted: {jti}")
+            else:
+                print(f"No matching outstanding token found for JTI: {jti}")
+
+        except Exception as e:
+            print(f"Error blacklisting access token: {e}")
+    else:
+        print("No access token provided in the Authorization header.")
+
+    # Clear all temporary user data
+    temp_user_data.clear()
+    print(f"Cleared all temporary data: {temp_user_data}")
+
+    return Response({"message": "Successfully logged out and blacklisted tokens."}, status=200)
+
+
+@api_view(['GET', 'POST'])
+def register(request):
+    if request.method == 'GET':
+        return Response({"message": "Please use POST to register a new user."})
+    username = request.data.get('username')
+    email = request.data.get('email')
+    password = request.data.get('password')
+    if not username or not email or not password:
+        return Response({"error": "All fields (username, email, and password) are required"}, status=400)
+    if User.objects.filter(username=username).exists():
+        return Response({"error": "Username already exists"}, status=400)
+    if User.objects.filter(email=email).exists():
+        return Response({"error": "Email already exists"}, status=400)
+    user = User.objects.create_user(username=username, email=email, password=password)
+    user.is_active = True
+    user.is_staff = False
+    user.save()
+    return Response("New user registered successfully")
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_user_info(request):
+    """Fetch user information."""
+    user = request.user
+    token = request.headers.get('Authorization')
+    return Response({
+        "user_id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "token": token
+    })
+
+@api_view(['GET'])
+def list_outstanding_tokens(request):
+    try:
+        print("Outstanding tokens:")
+        outstanding_tokens = []
+        for token in OutstandingToken.objects.all():
+            print(f"JTI: {token.jti}, User: {token.user}, Created: {token.created_at}")
+            outstanding_tokens.append({
+                "jti": token.jti,
+                "user": token.user.username if token.user else "Unknown",
+                "created_at": token.created_at,
+                "expires_at": token.expires_at,
+            })
+
+        return Response({"outstanding_tokens": outstanding_tokens}, status=200)
+
+    except Exception as e:
+        print(f"Error fetching outstanding tokens: {e}")
+        return Response({"error": "Unable to fetch outstanding tokens."}, status=500)
+
+@api_view(['GET'])
+@permission_classes([])  # Open to all users
+def search_product(request):
+    query = request.query_params.get('query')
+    if not query:
+        print("Search query is missing.")
+        return Response({"error": "Query parameter is required."}, status=400)
+
+    user = request.user if request.user.is_authenticated else None
+    token = request.headers.get('Authorization')
+
+    # Debugging: Print the user and token information
+    print(f"User: {user}, Is Authenticated: {request.user.is_authenticated}")
+    print(f"Authorization token: {token}")
+
+    if token:
+        try:
+            if token.startswith("Bearer "):
+                token = token.split(" ")[1]  # Remove 'Bearer ' prefix
+
+            access_token = AccessToken(token)
+            jti = access_token.get("jti")  # Extract the JTI from the access token
+            
+            # Check if the token is blacklisted or valid
+            outstanding_token = OutstandingToken.objects.filter(jti=jti).first()
+            if not outstanding_token:
+                print(f"Error validating access token: No matching outstanding token found for JTI: {jti}")
+                return Response({"error": "Invalid access token."}, status=401)
+
+            if BlacklistedToken.objects.filter(token=outstanding_token).exists():
+                print(f"Error validating access token: Token with JTI {jti} is blacklisted.")
+                return Response({"error": "Access token is blacklisted."}, status=401)
+
+        except InvalidToken as e:
+            print(f"Invalid access token provided: {e}")
+            return Response({"error": "Invalid access token."}, status=401)
+        except Exception as e:
+            print(f"An unexpected error occurred during token validation: {e}")
+            return Response({"error": "An error occurred while validating the token."}, status=500)
+
+    # Store temporary user data
+    if user:
+        print(f"Storing temporary data for user {user.id}.")
+        store_user_data(user.id, {'token': token, 'timestamp': time.time()})
+        print(f"Temporary data stored for user {user.id}: {temp_user_data.get(user.id)}")
+
+    try:
+        # Check if search results already exist
+        if not SearchResult.objects.filter(query=query).exists():
+            print(f"No existing search results for '{query}', triggering scraper.")
+            
+            # Trigger the scraper
+            async_to_sync(scrape_amazon)(query, user_id=user.id if user else None)
+            
+            # Check if scraper successfully populated results
+            search_result_count = SearchResult.objects.filter(query=query).count()
+            print(f"SearchResult count after scraping for '{query}': {search_result_count}")
+            
+            if search_result_count == 0:
+                print(f"No data found for query '{query}' after scraping.")
+                return Response({"message": f"No data found for '{query}'. Please try again later."}, status=404)
+
+        # Retrieve and serialize search results
+        search_results = SearchResult.objects.filter(query=query)
+        serializer = SearchResultSerializer(search_results, many=True)
+        
+        if user:
+            print(f"Updating temporary data for user {user.id} with search results.")
+            store_user_data(user.id, {
+                'token': token,
+                'timestamp': time.time(),
+                'search_results': serializer.data
+            })
+            print(f"Updated temporary data for user {user.id}: {temp_user_data.get(user.id)}")
+
+        print("Search results successfully serialized and returned.")
+        return Response(serializer.data)
+
+    except Exception as e:
+        # Print detailed error for debugging
+        print(f"An error occurred during search: {e}")
+        return Response({"error": f"An issue occurred while processing your request: {str(e)}"}, status=111)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def add_tracked_product(request):
+    user = request.user
+    stored_data = retrieve_user_data(user.id)
+
+    # Debugging: Log stored data and authorization token
+    print(f"User: {user}, Is Authenticated: {request.user.is_authenticated}")
+    print(f"Stored Data: {stored_data}")
+    print(f"Authorization Token: {request.headers.get('Authorization')}")
+
+    # Check if access token is blacklisted
+    token = request.headers.get('Authorization')
+    if token and token.startswith("Bearer "):
+        access_token = token.split(" ")[1]  # Remove 'Bearer ' prefix
+        try:
+            decoded_token = AccessToken(access_token)
+            jti = decoded_token.get('jti')  # Get unique identifier for the token
+            if BlacklistedToken.objects.filter(token_id=jti).exists():
+                print("Access token is blacklisted.")
+                return Response({"error": "Access token is invalid or blacklisted."}, status=401)
+        except Exception as e:
+            print(f"Error validating access token: {e}")
+            return Response({"error": "Invalid access token."}, status=401)
+
+    # Validate stored data and token
+    if not stored_data or not stored_data.get('token') == token:
+        print("Authentication mismatch or expired session.")
+        return Response({"error": "Authentication mismatch or expired session. Please log in again."}, status=401)
+
+    # Extract product data from the request
+    product_name = request.data.get('product_name')
+    product_price = request.data.get('product_price')
+    product_link = request.data.get('product_link')
+    product_rating = request.data.get('product_rating')
+    product_reviews = request.data.get('product_reviews')
+
+    # Validate required fields
+    if not product_name or not product_price or not product_link:
+        print("Missing required product information.")
+        return Response({"error": "Missing required product information (name, price, or link)."}, status=400)
+
+    # Check if the product is already being tracked
+    if TrackedProduct.objects.filter(title=product_name, user=user).exists():
+        print(f"Product '{product_name}' is already being tracked by user {user.id}.")
+        return Response({"message": "Product is already being tracked."}, status=400)
+
+    try:
+        # Create a new tracked product entry
+        tracked_product = TrackedProduct.objects.create(
+            user=user,
+            title=product_name,
+            price=product_price,
+            rating=product_rating,
+            reviews=product_reviews,
+            availability="Available",
+            date_scraped=timezone.now()
+        )
+        print(f"Tracked product created: {tracked_product}")
+
+        # Clear temporary data for the user
+        clear_user_data(user.id)
+        print(f"Temporary data cleared for user {user.id} after adding product.")
+
+        return Response({"message": f"Product '{tracked_product.title}' is now being tracked."}, status=201)
+
+    except Exception as e:
+        print(f"An error occurred while adding tracked product: {e}")
+        return Response({"error": "An issue occurred while processing your request."}, status=500)
+
