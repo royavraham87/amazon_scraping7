@@ -58,4 +58,8 @@ Balanced Approach:
 
 ### commands:
 celery -A scheduled_tasks worker --loglevel=info --pool=solo
+python manage.py test_actions
+
+
+* not used for now
 python manage.py test_scheduled_scraping

@@ -9,6 +9,7 @@ from amazoncaptcha import AmazonCaptcha
 from asgiref.sync import sync_to_async
 from django.contrib.auth.models import User
 from base.models import TrackedProduct, PriceHistory
+from decimal import Decimal, InvalidOperation
 
 
 # Set up Django environment
@@ -137,19 +138,41 @@ async def scrape_amazon(search_query, user_id=None, single_page=False, scheduled
                 for product in products:
                     try:
                         # Extract title
-                        title_element = await product.query_selector("span.a-text-normal")
-                        title = await title_element.text_content() if title_element else "No title found"
+                        title_element = await product.query_selector("h2")
+                        title = None
 
-                        # Extract price
+                        if title_element:
+                            # Check if the h2 element has an aria-label attribute (likely contains the full title)
+                            aria_label = await title_element.get_attribute("aria-label")
+                            if aria_label:
+                                title = aria_label.strip()
+                            else:
+                                # If aria-label is not present, combine all span elements under h2
+                                span_elements = await title_element.query_selector_all("span")
+                                title = " ".join([await span.text_content() for span in span_elements if span]).strip()
+
+                        # Handle "Sponsored Ad -" prefix
+                        if title and title.startswith("Sponsored Ad -"):
+                            title = title.replace("Sponsored Ad -", "").strip()
+
+                        # Default fallback if no title is found
+                        if not title:
+                            title = "No title found"
+
+                        # Extract and clean price
                         price_symbol = await product.query_selector("span.a-price-symbol")
                         price_whole = await product.query_selector("span.a-price-whole")
                         price_fraction = await product.query_selector("span.a-price-fraction")
                         symbol = await price_symbol.text_content() if price_symbol else ""
                         price = (
                             f"{symbol}{await price_whole.text_content()}.{await price_fraction.text_content()}"
-                            if price_whole and price_fraction else "No price found"
+                            if price_whole and price_fraction else "0.00"
                         )
-                        price = price.replace('..', '.')  # Correct any formatting issues
+                        price = price.replace('..', '.')
+                        try:
+                            price_numeric = Decimal(price.replace("$", "").replace(",", "").strip())
+                        except (InvalidOperation, ValueError):
+                            price_numeric = None
 
                         # Extract rating and reviews
                         rating_element = await product.query_selector("span.a-icon-alt")
@@ -158,31 +181,30 @@ async def scrape_amazon(search_query, user_id=None, single_page=False, scheduled
                         reviews = int((await reviews_element.text_content()).replace(",", "")) if reviews_element else None
 
                         # Retrieve product link
-                        link_element = await product.query_selector("a.a-link-normal.s-no-outline")
+                        link_element = await product.query_selector("a.a-link-normal")
                         product_link = f"https://www.amazon.com{await link_element.get_attribute('href')}" if link_element else None
 
                         # Debugging: Log product details
-                        print(f"{product_counter}. Product: {title}\n   Price: {price}\n   Rating: {rating}\n   Reviews: {reviews}\n   Link: {product_link}\n")
+                        print(f"{product_counter}. Product: {title}\n   Price: {price_numeric}\n   Rating: {rating}\n   Reviews: {reviews}\n   Link: {product_link}\n")
 
                         # Append product to the scraped_products list
                         scraped_products.append({
                             "title": title,
-                            "price": price,
+                            "price": price_numeric,
                             "rating": rating,
                             "reviews": reviews,
                             "link": product_link,
                         })
-                        product_counter += 1  # Increment product counter
+                        product_counter += 1
 
                     except Exception as e:
                         print(f"Error extracting product details: {e}")
                         continue
                 
-                # Stop after the first page if `single_page` is True
                 if single_page:
                     break
 
-                # Check for 'Next' button
+                # Navigate to the next page
                 next_button = await page.query_selector("a.s-pagination-item.s-pagination-next")
                 if next_button:
                     next_page_url = await next_button.get_attribute("href")
@@ -196,17 +218,11 @@ async def scrape_amazon(search_query, user_id=None, single_page=False, scheduled
                 print(f"Error scraping product data on page {current_page}: {e}")
                 break
         
-        # If scheduled scraping, return the scraped products without manual selection
         if scheduled_scraping:
             await browser.close()
             return scraped_products
 
-        # Otherwise, proceed to manual product selection
-
-        # Hand over scraped products to user selection logic for tracking
         await select_product_for_tracking(scraped_products, context, user.id)
-
-        # Close the browser
         await browser.close()
 
 
@@ -271,7 +287,8 @@ async def select_product_for_tracking(tracked_products, context, user_id=None):
                     # Check if product already exists
                     tracked_product = await sync_to_async(TrackedProduct.objects.filter)(
                         title=product_data["title"], user=user
-                    ).first()
+                    )
+                    tracked_product = await sync_to_async(tracked_product.first)()
 
                     if tracked_product:
                         # Update existing tracked product
@@ -302,7 +319,7 @@ async def select_product_for_tracking(tracked_products, context, user_id=None):
                         availability=availability,
                         date_recorded=current_time,
                     )
-                    print(f"Tracked product added: {product_data['title']} - Availability: {availability}")
+                    print(f"Price history entry added for: {product_data['title']} - Availability: {availability}")
                 except Exception as e:
                     print(f"Error saving product data: {e}")
             else:
@@ -316,6 +333,7 @@ if __name__ == "__main__":
     import asyncio
     search_query = input("Enter your search query: ")
     asyncio.run(scrape_amazon(search_query))  # Standalone run with no user association
+
 
 
 

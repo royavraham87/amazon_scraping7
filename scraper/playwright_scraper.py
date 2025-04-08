@@ -18,12 +18,6 @@ sys.path.append("..")  # Adjust to your project's base directory
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproj.settings")  # Update with the correct path to your settings
 django.setup()
 
-# Import Django models and other modules after Django setup
-from django.contrib.auth.models import User  # Import User model to retrieve superuser
-from base.models import TrackedProduct, PriceHistory  # Import the models
-
-# Dictionary to store tracked products by their full name
-# tracked_products = {}
 
 async def scrape_amazon(search_query, user_id=None, single_page=False, scheduled_scraping=False):
     """
@@ -138,15 +132,31 @@ async def scrape_amazon(search_query, user_id=None, single_page=False, scheduled
                 for product in products:
                     try:
                         # Extract title
-                        title_element = await product.query_selector("h2 span")
-                        title = await title_element.text_content() if title_element else None
+                        title_element = await product.query_selector("h2")
+                        title = None
 
-                        if not title:
-                            h2_element = await product.query_selector("h2")
-                            title = await h2_element.get_attribute("aria-label") if h2_element else "No title found"
+                        if title_element:
+                            # Check if the h2 element has an aria-label attribute (likely contains the full title)
+                            aria_label = await title_element.get_attribute("aria-label")
+                            if aria_label:
+                                title = aria_label.strip()
+                            else:
+                                # If aria-label is not present, handle spans inside h2
+                                span_elements = await title_element.query_selector_all("span")
+                                if len(span_elements) > 1:
+                                    # Use the second span when multiple spans are present
+                                    title = await span_elements[1].text_content()
+                                elif len(span_elements) == 1:
+                                    # Use the single span if only one exists
+                                    title = await span_elements[0].text_content()
 
+                        # Handle "Sponsored Ad -" prefix
                         if title and title.startswith("Sponsored Ad -"):
                             title = title.replace("Sponsored Ad -", "").strip()
+
+                        # Default fallback if no title is found
+                        if not title:
+                            title = "No title found"
 
                         # Extract and clean price
                         price_symbol = await product.query_selector("span.a-price-symbol")
@@ -189,7 +199,7 @@ async def scrape_amazon(search_query, user_id=None, single_page=False, scheduled
                     except Exception as e:
                         print(f"Error extracting product details: {e}")
                         continue
-                
+
                 if single_page:
                     break
 
@@ -206,7 +216,7 @@ async def scrape_amazon(search_query, user_id=None, single_page=False, scheduled
             except Exception as e:
                 print(f"Error scraping product data on page {current_page}: {e}")
                 break
-        
+
         if scheduled_scraping:
             await browser.close()
             return scraped_products
@@ -317,6 +327,7 @@ async def select_product_for_tracking(tracked_products, context, user_id=None):
             print("Please enter a valid number.")
         except Exception as e:
             print(f"Unexpected error: {e}")
+
 
 if __name__ == "__main__":
     import asyncio

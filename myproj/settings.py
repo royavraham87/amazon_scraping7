@@ -43,9 +43,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt.token_blacklist',  # Token Blacklist for JWT
     "corsheaders",
-    'django_celery_beat',  # Celery beat for periodic tasks
-    'django_celery_results',  # Store Celery task results
-    'scheduled_tasks',
+    'scheduled_tasks.apps.ScheduledTasksConfig',  # ✅ APScheduler support
 ]
 
 REST_FRAMEWORK = {
@@ -168,15 +166,11 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ALLOW_ALL_ORIGINS = True
 
-# Celery settings
-CELERY_BROKER_URL = 'redis://localhost:6379/0'  # Redis URL
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-
-# Celery beat settings
-CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers.DatabaseScheduler'
-
-
-# Email settings: Outputs emails to the terminal for testing
+# Mock email backend for development
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+EMAIL_HOST = 'localhost'
+EMAIL_PORT = 1025
+EMAIL_USE_TLS = False
+EMAIL_HOST_USER = ''
+EMAIL_HOST_PASSWORD = ''
+DEFAULT_FROM_EMAIL = 'mockemail@example.com'
